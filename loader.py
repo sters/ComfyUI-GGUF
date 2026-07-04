@@ -10,7 +10,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen35", "qwen3vl", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -206,6 +206,78 @@ GEMMA3_SD_MAP.update({
     "post_attention_norm": "post_attention_layernorm",
 })
 
+# Qwen3.5 hybrid blocks mix regular attention layers (attn_q/k/v, same as LLAMA_SD_MAP)
+# with linear-attention (GatedDeltaNet/SSM) layers. The fused/ssm-specific keys must be
+# remapped before the generic "attn_q"/"attn_k"/"attn_v" patterns below, since e.g.
+# "attn_qkv" starts with "attn_q" and would otherwise get partially replaced first.
+QWEN35_SD_MAP = {
+    # comfy.sd.detect_te_model()/load_text_encoder_state_dicts() expect the raw HF
+    # checkpoint layout (weights nested under "model.language_model."), and only
+    # strip that prefix down to "model.*" *after* detection has already matched on
+    # "model.language_model.layers.0.linear_attn.A_log". So unlike the other archs
+    # above, we must reproduce that prefix here rather than target comfy's final
+    # internal key names directly.
+    "blk.": "model.language_model.layers.",
+    "attn_norm": "input_layernorm",
+    "attn_q_norm.": "self_attn.q_norm.",
+    "attn_k_norm.": "self_attn.k_norm.",
+    "attn_qkv": "linear_attn.in_proj_qkv",
+    "attn_gate": "linear_attn.in_proj_z",
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_output": "self_attn.o_proj",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+    "ffn_gate": "mlp.gate_proj",
+    "post_attention_norm": "post_attention_layernorm",
+    "ssm_alpha": "linear_attn.in_proj_a",
+    "ssm_beta": "linear_attn.in_proj_b",
+    "ssm_conv1d": "linear_attn.conv1d",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_norm": "linear_attn.norm",
+    "ssm_out": "linear_attn.out_proj",
+    "ssm_a": "linear_attn.A_log",
+    "token_embd": "model.language_model.embed_tokens",
+    "output_norm": "model.language_model.norm",
+    "output.weight": "lm_head.weight",
+}
+
+def qwen35_tensor_corrections(sd):
+    # llama.cpp stores the depthwise ssm_conv1d weight as a 2D (channels, kernel_size)
+    # tensor, but comfy's GatedDeltaNet uses nn.Conv1d(groups=channels), which expects
+    # (channels, 1, kernel_size).
+    for key in list(sd.keys()):
+        if key.endswith("linear_attn.conv1d.weight"):
+            v = sd[key]
+            if v.dim() == 2:
+                v.data = v.data.unsqueeze(1)
+                if hasattr(v, "tensor_shape"):
+                    v.tensor_shape = v.data.shape
+                sd[key] = v
+
+    # comfy.text_encoders.qwen35.Qwen35Config sets rms_norm_add=True, i.e. every
+    # RMSNorm except the linear-attention gated norm computes x * (1 + weight).
+    # The values stored in this GGUF are already the plain multiplier (they average
+    # ~1.0-3.5, not ~0), so applying comfy's "+1" on top doubles the scale and the
+    # model degenerates into garbage output. Subtracting 1 here cancels that out.
+    # (linear_attn.norm/RMSNormGated is constructed with add=False in comfy, so it's
+    # already consistent and must NOT be corrected.)
+    norm_patterns = [
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "model.language_model.norm.weight",
+    ]
+    for key in list(sd.keys()):
+        if any(key.endswith(p) for p in norm_patterns):
+            if is_quantized(sd[key]):
+                sd[key] = dequantize_tensor(sd[key], dtype=torch.float32) - 1.0
+            else:
+                sd[key] = sd[key].float() - 1.0
+    return sd
+
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
     "v.post_ln.": "visual.merger.ln_q.",
@@ -268,10 +340,7 @@ def strip_quant_suffix(name):
         name = name[:match.start()]
     return name
 
-def gguf_mmproj_loader(path):
-    # Reverse version of Qwen2VLVisionModel.modify_tensors
-    logging.info("Attenpting to find mmproj file for text encoder...")
-
+def find_mmproj_file(path):
     # get name to match w/o quant suffix
     tenc_fname = os.path.basename(path)
     tenc = os.path.splitext(tenc_fname)[0].lower()
@@ -290,13 +359,21 @@ def gguf_mmproj_loader(path):
             target.append(fname)
 
     if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
-        return {}
+        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Vision input will be broken!")
+        return None
     if len(target) > 1:
         logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
-    target = os.path.join(root, target[0])
+    return os.path.join(root, target[0])
+
+def gguf_mmproj_loader(path):
+    # Reverse version of Qwen2VLVisionModel.modify_tensors
+    logging.info("Attenpting to find mmproj file for text encoder...")
+
+    target = find_mmproj_file(path)
+    if target is None:
+        return {}
     vsd, _ = gguf_sd_loader(target, is_text_model=True)
 
     # concat 4D to 5D
@@ -332,6 +409,41 @@ def gguf_mmproj_loader(path):
             ], dim=0)
         del attns
 
+    return vsd
+
+# Qwen3.5's vision tower already stores a fused QKV projection (matching
+# Qwen35VisionAttention.qkv), so unlike CLIP_VISION_SD_MAP/gguf_mmproj_loader
+# above (Qwen2VL, split Q/K/V) this is a straight key rename, no split needed.
+QWEN35_VISION_SD_MAP = {
+    "v.patch_embd": "visual.patch_embed.proj",
+    "v.position_embd": "visual.pos_embed",
+    "v.blk.": "visual.blocks.",
+    "attn_qkv": "attn.qkv",
+    "attn_out": "attn.proj",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "ln1.": "norm1.",
+    "ln2.": "norm2.",
+    "v.post_ln": "visual.merger.norm",
+    "mm.0": "visual.merger.linear_fc1",
+    "mm.2": "visual.merger.linear_fc2",
+}
+
+def gguf_qwen35_mmproj_loader(path):
+    logging.info("Attempting to find mmproj file for Qwen3.5 vision encoder...")
+
+    target = find_mmproj_file(path)
+    if target is None:
+        return {}
+    vsd, _ = gguf_sd_loader(target, is_text_model=True)
+
+    # concat 4D to 5D (2 temporal patch frames -> Conv3d kernel dim)
+    if "v.patch_embd.weight.1" in vsd:
+        w1 = dequantize_tensor(vsd.pop("v.patch_embd.weight"), dtype=torch.float32)
+        w2 = dequantize_tensor(vsd.pop("v.patch_embd.weight.1"), dtype=torch.float32)
+        vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
+
+    vsd = sd_map_replace(vsd, QWEN35_VISION_SD_MAP)
     return vsd
 
 def gguf_tokenizer_loader(path, temb_shape):
@@ -479,7 +591,7 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
+    elif arch in {"llama", "qwen2vl", "qwen3", "qwen35", "qwen3vl", "gemma3"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
@@ -494,12 +606,18 @@ def gguf_clip_loader(path):
         if arch == "gemma3":
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
+        elif arch == "qwen35":
+            sd = sd_map_replace(sd, QWEN35_SD_MAP)
+            sd = qwen35_tensor_corrections(sd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
+            sd.update(vsd)
+        if arch == "qwen35":
+            vsd = gguf_qwen35_mmproj_loader(path)
             sd.update(vsd)
     else:
         pass
